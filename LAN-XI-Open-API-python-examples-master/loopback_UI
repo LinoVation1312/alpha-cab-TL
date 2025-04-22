@@ -1,0 +1,1044 @@
+"""
+Interface d'acquisition multi-canal avec paramètres configurables
+et affichage interactif après lancement.
+"""
+
+################################################################################
+# Importations 
+################################################################################
+import requests
+import socket
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, TextBox, Slider, RadioButtons, CheckButtons
+from matplotlib.widgets import AxesWidget
+import tkinter as tk
+from tkinter import ttk
+from time import sleep
+import sys
+import json
+import threading
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import HelpFunctions.utility as utility
+from openapi.openapi_header import OpenapiHeader
+from openapi.openapi_stream import OpenapiStream
+
+
+################################################################################
+# Paramètres par défaut
+################################################################################
+
+DEFAULT_PARAMS = {
+    # Adresse IP du module LAN-XI utilisé pour les requêtes REST
+    "ip": "169.254.254.218",
+
+    # Durée de la capture ou de l'acquisition en secondes
+    "duration_seconds": 4.0,
+
+    # Nombre total de canaux d'entrée actifs (parmi les 4 disponibles sur le module)
+    "nb_channels": 4,
+
+    # Numéro du canal de sortie utilisé pour le générateur de signal (ex : 1 pour canal 1)
+    "generator_output_channel": 1,
+
+    # Type de signal généré
+    "waveform": "logsweep",  # Options: sine, square, linsweep, logsweep, random, p_random
+
+    # Paramètres pour signaux périodiques (sine, square)
+    "generator_frequency": 432.0,   # Hz
+    
+    # Paramètres communs
+    "generator_gain": 0.2,  # Gain appliqué à la sortie du générateur (entre 0.0 et < 1.0)
+    "generator_offset": 0.0,  # Offset DC ajouté à la sortie du générateur (entre -1.0 et 1.0)
+    "generator_floating": False,  # Mode flottant (True = flottant, False = masse référencée)
+    "input_gain": 0.75,  # Gain appliqué au signal d'entrée
+    "input_offset": 0.0,  # Offset appliqué au signal d'entrée
+    "phase": 0.0,  # Phase initiale du signal (en degrés)
+
+    # Paramètres pour sweeps (linsweep, logsweep)
+    "start_frequency": 100.0,  # Hz
+    "stop_frequency": 10000.0,  # Hz
+    "sweep_direction": 0,  # 0: start->stop->start, 1: start->stop->reverse
+    "linsweep_hz_second": 4000.0,  # Hz/s, vitesse pour linsweep
+    "logsweep_decades_sec": 2,  # decades/s, vitesse pour logsweep
+
+    # Paramètres pour signaux aléatoires (random)
+    "bandwidth": 10000,  # Bande passante du bruit
+    "hp_filter": True,  # Activation du filtre passe-haut
+
+    # Paramètres pour signal pseudo-aléatoire (p_random)
+    "fftlines": 1600,  # Nombre de lignes FFT dans la génération
+    "nbseq": 4,        # Nombre de séquences à générer
+
+    # Paramètre de synchronisation (master = référence, slave = asservi à un autre)
+    "sync_mode": "master",
+
+    # Rampe d'arrêt en douceur lors de l'arrêt du générateur
+    "ramp_down": True,
+
+    # Sensibilités micro (en V/Pa) pour chaque canal actif
+    "mic_sensitivities": [0.0425385, 0.0432, 0.0435, 0.04358],
+
+    # Paramètres d'affichage du spectre FFT
+    "graph_background_color": "lightyellow",
+    "graph_background2_color": "mintcream",
+    "graph_line_color": "blue",
+    "graph_title": "Spectre FFT [dB SPL]",
+
+    # Limites d'affichage sur les axes
+    "xlim": [250, 10000],   # Axe des fréquences (Hz)
+    "ylim": [-20, 130],     # Axe des niveaux SPL (dB)
+
+    # Lissage de la courbe FFT
+    "smooth_qty": 75,
+}
+
+# Dictionnaire pour stocker les paramètres configurés
+PARAMS = DEFAULT_PARAMS.copy()
+
+################################################################################
+# Fonctions utilitaires
+################################################################################
+
+def reset_recorder(host):
+    """Ferme et réinitialise le recorder pour éviter les erreurs 403"""
+    try:
+        # Essayer d'abord d'arrêter la mesure et le générateur
+        requests.put(host + "/rest/rec/measurements/stop", timeout=2)
+        requests.put(host + "/rest/rec/generator/stop", timeout=2)
+        # Ensuite fermer le recorder
+        requests.put(host + "/rest/rec/close", timeout=2)
+        print("Recorder réinitialisé avec succès")
+        sleep(1)  # Attendre que le système se stabilise
+        return True
+    except Exception as e:
+        print(f"Erreur lors de la réinitialisation du recorder: {e}")
+        sleep(2)  # Attendre plus longtemps en cas d'erreur
+        return False
+
+def open_recorder(host):
+    try:
+        response = requests.put(host + "/rest/rec/open")
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Erreur lors de l'ouverture du recorder: {e}")
+        return False
+
+def get_module_info(host):
+    try:
+        response = requests.get(host + "/rest/rec/module/info")
+        response.raise_for_status()
+        module_info = response.json()
+        print(f"Module Info: {module_info}")
+        return module_info
+    except Exception as e:
+        print(f"Erreur lors de la récupération des infos du module: {e}")
+        return None
+
+def create_recording(host):
+    try:
+        response = requests.put(host + "/rest/rec/create")
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Erreur lors de la création de l'enregistrement: {e}")
+        reset_recorder(host)
+        return False
+
+def get_default_input_setup(host):
+    response = requests.get(host + "/rest/rec/channels/input/default")
+    response.raise_for_status()
+    return response.json()
+
+def configure_input_channels(host, setup):
+    # Désactiver TOUS les canaux renvoyés dans le setup
+    for idx, channel in enumerate(setup["channels"]):
+        channel["enabled"] = False
+
+    # Activation et configuration uniquement des canaux souhaités
+    for ch in range(len(setup["channels"])):
+        if ch < PARAMS["nb_channels"]:
+            setup["channels"][ch]["enabled"] = True
+            # Activer le mode CCLD pour les microphones à condensateur
+            setup["channels"][ch]["ccld"] = True
+            # Configurer la sensibilité uniquement si elle est définie
+            if ch < len(PARAMS["mic_sensitivities"]) and PARAMS["mic_sensitivities"][ch] > 0:
+                sensitivity_v_pa = PARAMS["mic_sensitivities"][ch]
+            else:
+                # Valeur par défaut si non définie ou nulle
+                sensitivity_v_pa = 1.0
+            setup["channels"][ch]["transducer"]["sensitivity"] = sensitivity_v_pa
+            setup["channels"][ch]["transducer"]["unit"] = "Pa"
+            print(f"Canal {ch}: sensibilité configurée à {sensitivity_v_pa} V/Pa")
+        else:
+            # Désactiver explicitement les canaux non utilisés
+            setup["channels"][ch]["enabled"] = False
+    print("Configuration des canaux d'entrée :", setup)
+    response = requests.put(host + "/rest/rec/channels/input", json=setup)
+    response.raise_for_status()
+
+def prepare_generator(host):
+    """Prépare le générateur en réinitialisant les paramètres"""
+    try:
+        response = requests.put(
+            f"{host}/rest/rec/generator/prepare",
+            json={
+                "outputs": [
+                    {"number": PARAMS["generator_output_channel"]}
+                ]
+            },
+            timeout=2
+        )
+        response.raise_for_status()
+        print(f"Générateur préparé sur le canal {PARAMS['generator_output_channel']}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Erreur de préparation du générateur: {str(e)}")
+        return False
+    
+def get_default_generator_setup(host):
+    """Récupère la configuration par défaut du générateur"""
+    try:
+        response = requests.get(f"{host}/rest/rec/generator/output/default", timeout=2)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Erreur de récupération de configuration: {str(e)}")
+        return None
+
+def configure_generator(host, generator_setup):
+    """Configure dynamiquement le générateur selon les paramètres utilisateur"""
+    try:
+        # Accès aux paramètres de sortie du premier canal
+        output = generator_setup["outputs"][0]
+        
+        # Configuration des paramètres de sortie principaux
+        output["gain"] = max(0.0, min(0.999, PARAMS.get("generator_gain", 1.0)))
+        output["floating"] = PARAMS.get("generator_floating", False)
+        
+        # Si le paramètre offset existe dans la structure, on le configure
+        if "offset" in output:
+            output["offset"] = max(-0.999, min(0.999, PARAMS.get("generator_offset", 0.0)))
+        
+        # Configuration du signal d'entrée (type de signal)
+        if len(output["inputs"]) > 0:
+            input_signal = output["inputs"][0]
+            input_signal["signalType"] = PARAMS["waveform"]
+            input_signal["gain"] = max(0.0, min(0.999, PARAMS.get("input_gain", 0.75)))
+            
+            # Si le paramètre offset existe dans la structure, on le configure
+            if "offset" in input_signal:
+                input_signal["offset"] = max(-0.999, min(0.999, PARAMS.get("input_offset", 0.0)))
+            
+            # Paramètres spécifiques selon le type de signal
+            if PARAMS["waveform"] in ["sine", "square"]:
+                input_signal["frequency"] = PARAMS["generator_frequency"]
+                if "phase" in input_signal:
+                    input_signal["phase"] = PARAMS.get("phase", 0.0)
+            
+            # Paramètres pour sweeps
+            if PARAMS["waveform"] == "linsweep":
+                input_signal["start_frequency"] = PARAMS.get("start_frequency", 100.0)
+                input_signal["stop_frequency"] = PARAMS.get("stop_frequency", 5000.0)
+                input_signal["phase"] = PARAMS.get("phase", 0.0)
+                input_signal["direction"] = PARAMS.get("sweep_direction", 0)
+                input_signal["hz_second"] = PARAMS.get("linsweep_hz_second", 1000.0)
+            if PARAMS["waveform"] == "logsweep":
+                input_signal["start_frequency"] = PARAMS.get("start_frequency", 100.0)
+                input_signal["stop_frequency"] = PARAMS.get("stop_frequency", 5000.0)
+                input_signal["phase"] = PARAMS.get("phase", 0.0)
+                input_signal["direction"] = PARAMS.get("sweep_direction", 0)
+                input_signal["decades_sec"] = PARAMS.get("logsweep_decades_sec", 1.0)
+            
+            # Paramètres spécifiques aux signaux aléatoires
+            if PARAMS["waveform"] == "random" and "bandwidth" in input_signal:
+                input_signal["bandwidth"] = PARAMS.get("bandwidth", 10000)
+                if "hp_filter" in input_signal:
+                    input_signal["hp_filter"] = PARAMS.get("hp_filter", True)
+            
+            # Paramètres spécifiques au signal pseudo-aléatoire
+            if PARAMS["waveform"] == "p_random":
+                if "fftlines" in input_signal:
+                    input_signal["fftlines"] = PARAMS.get("fftlines", 1600)
+                if "nbseq" in input_signal:
+                    input_signal["nbseq"] = PARAMS.get("nbseq", 4)
+        
+        print("Configuration du générateur:", generator_setup)
+        response = requests.put(f"{host}/rest/rec/generator/output", json=generator_setup, timeout=5)
+        response.raise_for_status()
+        print(f"Générateur configuré avec {PARAMS['waveform']} à {PARAMS.get('generator_frequency', 'N/A')}Hz")
+        return generator_setup
+    
+    except (KeyError, IndexError) as e:
+        print(f"Erreur dans la structure de configuration du générateur: {str(e)}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"Erreur de configuration du générateur: {str(e)}")
+        return None
+
+def start_generator(host):
+    """Démarre la génération du signal avec gestion des erreurs"""
+    try:
+        response = requests.put(
+            f"{host}/rest/rec/generator/start",
+            json={
+                "outputs": [
+                    {
+                        "number": PARAMS["generator_output_channel"],
+                        "sync": PARAMS.get("sync_mode", "master")
+                    }
+                ]
+            },
+            timeout=2
+        )
+        response.raise_for_status()
+        print(f"Génération démarrée sur le canal {PARAMS['generator_output_channel']}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Erreur de démarrage du générateur: {str(e)}")
+        return False
+
+def start_measurement(host):
+    response = requests.post(host + "/rest/rec/measurements")
+    response.raise_for_status()
+
+def get_streaming_port(host):
+    response = requests.get(host + "/rest/rec/destination/socket")
+    response.raise_for_status()
+    port = response.json()["tcpPort"]
+    print(f"Port de streaming : {port}")
+    return port
+
+def stop_measurement(host):
+    try:
+        response = requests.put(host + "/rest/rec/measurements/stop")
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Erreur lors de l'arrêt de la mesure : {e}")
+
+def stop_generator(host):
+    """Arrête proprement la génération du signal"""
+    try:
+        response = requests.put(
+            f"{host}/rest/rec/generator/stop",
+            json={
+                "outputs": [
+                    {
+                        "number": PARAMS["generator_output_channel"],
+                        "ramp_down": PARAMS.get("ramp_down", True)
+                    }
+                ]
+            },
+            timeout=2
+        )
+        response.raise_for_status()
+        print("Génération arrêtée avec succès")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Erreur lors de l'arrêt du générateur: {str(e)}")
+        return False
+
+def calculate_sample_rate(setup, module_info):
+    # Extraction et calcul du taux d'échantillonnage en fonction de la bande passante
+    bandwidth_str = setup["channels"][0]["bandwidth"]
+    bandwidth_value = eval(bandwidth_str.replace('kHz', '*1000'))
+    supported_sample_rates = module_info["supportedSampleRates"]
+    sample_rate = min(supported_sample_rates, key=lambda x: abs(x - bandwidth_value * 2))
+    print(f"Taux d'échantillonnage utilisé : {sample_rate}")
+    return sample_rate
+
+################################################################################
+# Acquisition multi-canal et traitement des données
+################################################################################
+
+def stream_data(ip, port, sample_rate, duration_seconds, nb_channels):
+    total_samples = int(sample_rate * duration_seconds)
+    data_arrays = {chan: np.array([]) for chan in range(nb_channels)}
+    interpretations = [{} for _ in range(nb_channels)]
+     
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((ip, port))
+            s.settimeout(10)  # Timeout pour éviter de bloquer indéfiniment
+            
+            while any(data_arrays[chan].size < total_samples for chan in range(nb_channels)):
+                try:
+                    header_data = s.recv(28)
+                    if not header_data or len(header_data) < 28:
+                        print("Données d'en-tête incomplètes, tentative de reconnexion...")
+                        continue
+                    
+                    header = OpenapiHeader.from_bytes(header_data)
+                    content_length = header.content_length
+                    
+                    remaining_data = bytearray()
+                    bytes_to_read = content_length
+                    
+                    while bytes_to_read > 0:
+                        chunk = s.recv(min(4096, bytes_to_read))
+                        if not chunk:
+                            break
+                        remaining_data.extend(chunk)
+                        bytes_to_read -= len(chunk)
+                    
+                    if bytes_to_read > 0:
+                        print(f"Paquet incomplet: attendu {content_length}, reçu {content_length - bytes_to_read}")
+                        continue
+                    
+                    complete_packet = header_data + remaining_data
+                    package = OpenapiStream.from_bytes(complete_packet)
+                    
+                    if package.header.message_type == OpenapiStream.Header.EMessageType.e_interpretation:
+                        for interpretation in package.content.interpretations:
+                            channel_idx = interpretation.signal_id - 1
+                            if 0 <= channel_idx < nb_channels:
+                                interpretations[channel_idx][interpretation.descriptor_type] = interpretation.value
+                                if interpretation.descriptor_type == OpenapiStream.Interpretation.EDescriptorType.unit:
+                                    print(f"Canal {channel_idx}: unité = {interpretation.value}")
+                    
+                    if package.header.message_type == OpenapiStream.Header.EMessageType.e_signal_data:
+                        for signal in package.content.signals:
+                            if signal is not None:
+                                chan = signal.signal_id - 1
+                                if 0 <= chan < nb_channels:
+                                    sensitivity = PARAMS["mic_sensitivities"][chan] if chan < len(PARAMS["mic_sensitivities"]) else 1
+                                    values = np.array([x.calc_value for x in signal.values])
+                                    data_arrays[chan] = np.append(data_arrays[chan], values)
+                                    print(f"Canal {chan}: {len(values)} échantillons reçus, total: {data_arrays[chan].size}")
+                
+                except Exception as e:
+                    print(f"Erreur durant le streaming: {e}")
+    
+    except Exception as e:
+        print(f"Une erreur s'est produite : {e}")
+    
+    for chan in range(nb_channels):
+        print(f"Total échantillons canal {chan}: {data_arrays[chan].size}")
+    
+    return data_arrays, interpretations
+
+def compute_fft(data, sample_rate, interpretation, chan_idx):
+    if len(data) == 0:
+        return np.array([]), np.array([])
+        
+    window = np.hamming(len(data))
+    scale_factor = interpretation.get(OpenapiStream.Interpretation.EDescriptorType.scale_factor, 1)
+    
+    data_volt = (data * scale_factor) / (2 ** 23)
+    freq, s_dbfs = utility.dbfft(data_volt, sample_rate, window, ref=1)
+    
+    # Conversion de dBV à dBSPL
+    sensitivity = PARAMS["mic_sensitivities"][chan_idx] if chan_idx < len(PARAMS["mic_sensitivities"]) else 1
+    if sensitivity > 0:
+        s_dbspl = s_dbfs - 20 * np.log10(sensitivity) + 94 - 27.8
+    else:
+        s_dbspl = s_dbfs  # Éviter la division par zéro ou log(0)
+    
+    return freq, s_dbspl
+
+def calculate_energy_average_SPL(spl_arrays):
+    """
+    Calcule le SPL moyen en énergie à partir d'une liste de courbes SPL en dB.
+    """
+    ref = 20e-6
+    ref_sq = ref**2
+    # Conversion en p² pour chaque courbe SPL (dB)
+    p_squared_arrays = [ ref_sq * 10**(spl / 10.0) for spl in spl_arrays ]
+    # Moyenne spatiale en énergie (point par point)
+    p_squared_mean = np.mean(p_squared_arrays, axis=0)
+    # Conversion en SPL (dB)
+    spl_mean_energy = 10 * np.log10(p_squared_mean / ref_sq)
+    return spl_mean_energy
+
+def smooth_curve(y, window_size=5):
+    """
+    Lisse la courbe y en appliquant une moyenne mobile sur une fenêtre de taille window_size.
+    """
+    if window_size < 1:
+        return y
+    window = np.ones(int(window_size)) / float(window_size)
+    return np.convolve(y, window, mode='same')
+
+################################################################################
+# Acquisition complète et mise à jour de l'affichage
+################################################################################
+
+def perform_measurement(status_callback=None):
+    """
+    Effectue une mesure complète avec les paramètres définis dans PARAMS
+    
+    Args:
+        status_callback: Fonction à appeler pour mettre à jour l'état d'avancement (prend une chaîne en paramètre)
+    
+    Returns:
+        Tuple (data_dict, interpretations, sample_rate): Les données acquises et les paramètres d'interprétation
+    """
+    host = "http://" + PARAMS["ip"]
+    print("Démarrage de la configuration...")
+    
+    if status_callback:
+        status_callback("Initialisation du matériel...")
+    
+    try:
+        # Réinitialiser proprement le recorder
+        if not reset_recorder(host):
+            print("Réinitialisation du recorder échouée, nouvelle tentative...")
+            sleep(2)
+            reset_recorder(host)
+        
+        if status_callback:
+            status_callback("Ouverture du recorder...")
+            
+        if not open_recorder(host):
+            print("Impossible d'ouvrir le recorder, arrêt.")
+            return {}, [{} for _ in range(PARAMS["nb_channels"])], 0
+            
+        module_info = get_module_info(host)
+        if not module_info:
+            return {}, [{} for _ in range(PARAMS["nb_channels"])], 0
+        
+        if status_callback:
+            status_callback("Création de l'enregistrement...")
+            
+        if not create_recording(host):
+            return {}, [{} for _ in range(PARAMS["nb_channels"])], 0
+            
+        setup = get_default_input_setup(host)
+        utility.update_value("destinations", ["socket"], setup)
+        
+        if status_callback:
+            status_callback("Configuration des canaux d'entrée...")
+            
+        configure_input_channels(host, setup)
+        
+        if status_callback:
+            status_callback("Préparation du générateur...")
+            
+        prepare_generator(host)
+        generator_setup = get_default_generator_setup(host)
+        configure_generator(host, generator_setup)
+        
+        if status_callback:
+            status_callback("Démarrage du générateur...")
+            
+        start_generator(host)
+        sleep(0.5)
+        
+        if status_callback:
+            status_callback("Préparation du streaming...")
+            
+        port = get_streaming_port(host)
+        
+        if status_callback:
+            status_callback("Démarrage de la mesure...")
+            
+        start_measurement(host)
+        
+        sample_rate = calculate_sample_rate(setup, module_info)
+        
+        if status_callback:
+            status_callback(f"Acquisition en cours ({PARAMS['duration_seconds']} secondes)...")
+            
+        data_dict, interpretations = stream_data(PARAMS["ip"], port, sample_rate, PARAMS["duration_seconds"], PARAMS["nb_channels"])
+        
+        if status_callback:
+            status_callback("Arrêt des mesures...")
+            
+        stop_measurement(host)
+        stop_generator(host)
+        
+        if status_callback:
+            status_callback("Acquisition terminée")
+            
+        return data_dict, interpretations, sample_rate
+        
+    except Exception as e:
+        print(f"Erreur pendant la mesure: {e}")
+        if status_callback:
+            status_callback(f"Erreur: {e}")
+        return {}, [{} for _ in range(PARAMS["nb_channels"])], 0
+        
+    finally:
+        # S'assurer que tout est bien arrêté et fermé à la fin, même en cas d'erreur
+        try:
+            stop_measurement(host)
+            stop_generator(host)
+            # Ne pas fermer le recorder ici car cela empêcherait l'extraction des données
+        except:
+            pass
+
+################################################################################
+# Mise à jour des graphiques interactifs
+################################################################################
+
+def update_figure(fig, axs, data_dict, interpretations, sample_rate):
+    """
+    Met à jour les graphiques avec les données acquises
+    
+    Args:
+        fig: Figure matplotlib
+        axs: Liste des axes pour chaque canal
+        data_dict: Dictionnaire des données acquises par canal
+        interpretations: Liste des dictionnaires d'interprétation par canal
+        sample_rate: Taux d'échantillonnage
+    """
+    if hasattr(axs, "ndim") and axs.ndim == 2:
+        axs = axs.flatten()
+
+    fig.subplots_adjust(hspace=0.5, top=0.92, bottom=0.15, left=0.1, right=0.95)
+
+    for chan, ax in enumerate(axs):
+        ax.clear()
+        if chan not in data_dict or data_dict[chan].size == 0:
+            ax.text(0.5, 0.5, f"Aucune donnée pour le canal {chan}",
+                    horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+        else:
+            freq, s_dbspl = compute_fft(data_dict[chan], sample_rate, interpretations[chan], chan)
+            if len(freq) > 0:
+                s_dbspl_smoothed = smooth_curve(s_dbspl, window_size=PARAMS["smooth_qty"])
+
+                min_freq_idx = np.argmax(freq >= 250)
+                if min_freq_idx < len(freq):
+                    max_idx = min_freq_idx + np.argmax(s_dbspl[min_freq_idx:])
+                    max_freq = freq[max_idx]
+                    max_spl = s_dbspl[max_idx]
+                    peak_text = f"Pic max: {max_spl:.1f} dB @ {max_freq:.1f} Hz"
+                else:
+                    peak_text = "Pas de données >250 Hz"
+
+                ax.semilogx(freq, s_dbspl_smoothed, color=PARAMS["graph_line_color"])
+
+                octave_freqs = [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000]
+                ax.set_xticks(octave_freqs)
+                ax.set_xticklabels([str(f) for f in octave_freqs], rotation=45, fontsize=10)
+                ax.tick_params(axis='x', which='minor', bottom=False)  # Disable x minor ticks
+
+                ax.grid(True, which='major', linestyle='-', alpha=0.7)
+                ax.grid(True, which='minor', linestyle=':', alpha=0.4)
+                ax.minorticks_on()  # Enable minor ticks globally
+
+                if min_freq_idx < len(freq) and max_spl > 0:
+                    ax.plot(max_freq, max_spl, 'ro', markersize=6)
+                    y_pos = max_spl + 5 if max_spl < PARAMS["ylim"][1] - 10 else max_spl - 10
+                    ax.annotate(f"{max_spl:.1f} dB\n@ {max_freq:.1f} Hz",
+                                xy=(max_freq, max_spl),
+                                xytext=(max_freq, y_pos),
+                                textcoords='data',
+                                ha='center',
+                                fontsize=10,
+                                bbox=dict(facecolor='lightblue', alpha=0.7, edgecolor='none', pad=3),
+                                arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
+
+                ax.set_xlabel("Frequency [Hz]", fontsize=12)
+                ax.set_ylabel("Amplitude [dBSPL]", fontsize=12)
+                ax.set_xlim(PARAMS["xlim"])
+                ax.set_ylim(PARAMS["ylim"])
+
+                if chan < len(PARAMS["mic_sensitivities"]):
+                    sensitivity_mV = PARAMS["mic_sensitivities"][chan] * 1000
+                    ax_title = f"Canal {chan} - {sensitivity_mV:.1f}mV/Pa - {peak_text}"
+                else:
+                    ax_title = f"Canal {chan} - {peak_text}"
+                ax.set_title(ax_title, fontsize=12, fontweight='bold')
+                ax.set_facecolor(PARAMS["graph_background_color"])
+                ax.tick_params(axis='both', which='major', labelsize=10)
+            else:
+                ax.text(0.5, 0.5, f"Aucune donnée FFT pour le canal {chan}",
+                        horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+
+################################################################################
+# Interface graphique Tkinter modernisée (bouton visible)
+################################################################################
+
+class DynamicParamUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Acquisition multi-canal LAN-XI")
+        self.root.geometry("450x580")  # Taille réduite mais suffisante
+        self.root.configure(bg="#f5f5f7")  # Couleur de fond moderne
+        self.root.minsize(450, 580)  # Taille minimale pour garantir la visibilité
+        
+        # Configuration du style
+        self.setup_styles()
+        
+        self.param_widgets = {}
+        self.dynamic_fields = {}
+        self.create_widgets()
+
+    def setup_styles(self):
+        # Création d'un style moderne
+        style = ttk.Style()
+        style.theme_use('clam')  # Base de style propre
+        
+        # Couleurs modernes
+        primary_color = "#4a6fa5"  # Bleu foncé
+        secondary_color = "#7fb3d5"  # Bleu clair
+        bg_color = "#f5f5f7"  # Fond gris clair
+        text_color = "#333333"  # Texte foncé
+        
+        # Configuration des styles des widgets
+        style.configure("TFrame", background=bg_color)
+        style.configure("TLabel", background=bg_color, foreground=text_color, font=("Segoe UI", 10))
+        style.configure("TButton", 
+                        background=primary_color, 
+                        foreground="white", 
+                        font=("Segoe UI", 11, "bold"),
+                        padding=8)
+        style.map("TButton",
+                 background=[("active", secondary_color), ("pressed", primary_color)],
+                 foreground=[("active", "white"), ("pressed", "white")])
+        
+        # Style pour Combobox
+        style.configure("TCombobox", 
+                        fieldbackground=bg_color,
+                        background=bg_color,
+                        selectbackground=primary_color,
+                        selectforeground="white",
+                        padding=4)
+        
+        # Style pour Entry
+        style.configure("TEntry", 
+                        fieldbackground="white",
+                        padding=4)
+        
+        # Style pour Checkbutton
+        style.configure("TCheckbutton", 
+                        background=bg_color,
+                        foreground=text_color)
+        
+        # Style pour le bouton de lancement
+        style.configure("Launch.TButton", 
+                        background="#2ecc71",  # Vert clair
+                        foreground="white", 
+                        font=("Segoe UI", 12, "bold"),
+                        padding=10)
+        style.map("Launch.TButton",
+                 background=[("active", "#27ae60"), ("pressed", "#2ecc71")])
+
+    def create_widgets(self):
+        # Utiliser un Canvas avec Scrollbar pour gérer le défilement
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Créer un canvas
+        canvas = tk.Canvas(main_frame, bg="#f5f5f7", highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Ajouter une scrollbar au canvas
+        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Configurer le canvas
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        
+        # Créer un frame à l'intérieur du canvas
+        frm_container = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=frm_container, anchor="nw", width=canvas.winfo_reqwidth())
+        
+        # Le frame principal à l'intérieur du conteneur
+        frm = ttk.Frame(frm_container, padding=15)
+        frm.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Titre de l'application
+        title_label = ttk.Label(frm, text="Acquisition multi-canal LAN-XI", 
+                               font=("Segoe UI", 14, "bold"))
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 15), sticky="w")
+
+        # Choix du type de signal (waveform)
+        ttk.Label(frm, text="Type de signal :").grid(row=1, column=0, sticky="w", pady=4)
+        self.waveform_var = tk.StringVar(value=PARAMS["waveform"])
+        waveform_cb = ttk.Combobox(frm, textvariable=self.waveform_var, state="readonly")
+        waveform_cb["values"] = ["sine", "square", "linsweep", "logsweep", "random", "p_random"]
+        waveform_cb.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=4)
+        waveform_cb.bind("<<ComboboxSelected>>", self.update_dynamic_fields)
+
+        # Paramètres communs - avec moins d'espacement vertical
+        row = 2
+        for label, key, default in [
+            ("Durée (s)", "duration_seconds", PARAMS["duration_seconds"]),
+            ("Nb canaux actifs", "nb_channels", PARAMS["nb_channels"]),
+            ("Canal sortie générateur", "generator_output_channel", PARAMS["generator_output_channel"]),
+            ("Gain générateur", "generator_gain", PARAMS["generator_gain"]),
+            ("Offset générateur", "generator_offset", PARAMS["generator_offset"]),
+            ("Gain entrée", "input_gain", PARAMS["input_gain"]),
+            ("Offset entrée", "input_offset", PARAMS["input_offset"]),
+            ("Phase (°)", "phase", PARAMS["phase"]),
+        ]:
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            var = tk.StringVar(value=str(default))
+            entry = ttk.Entry(frm, textvariable=var, width=15)
+            entry.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+            self.param_widgets[key] = var
+            row += 1
+
+        # Séparateur pour les paramètres dynamiques
+        separator = ttk.Separator(frm, orient="horizontal")
+        separator.grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
+        row += 1
+
+        # Label pour section paramètres spécifiques
+        ttk.Label(frm, text="Paramètres spécifiques", 
+                 font=("Segoe UI", 11, "bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        row += 1
+
+        # Zone dynamique pour les paramètres spécifiques au waveform
+        self.dynamic_frame = ttk.Frame(frm)
+        self.dynamic_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
+        row += 1
+
+        # Séparateur avant les couleurs
+        separator2 = ttk.Separator(frm, orient="horizontal")
+        separator2.grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
+        row += 1
+
+        # Label pour section graphiques
+        ttk.Label(frm, text="Personnalisation des graphiques", 
+                 font=("Segoe UI", 11, "bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 6))
+        row += 1
+
+        # Liste des couleurs nommées pour FFT et TL - version moderne
+        self.bg_colors = [
+            "white", "aliceblue", "lavender", "mintcream", "honeydew", 
+            "azure", "ghostwhite", "seashell", "ivory", "snow"
+        ]
+
+        # Choix couleur de fond FFT
+        ttk.Label(frm, text="Fond FFT :").grid(row=row, column=0, sticky="w", pady=4)
+        self.bg_color_var = tk.StringVar(value=PARAMS.get("graph_background_color", "aliceblue"))
+        bg_cb = ttk.Combobox(frm, textvariable=self.bg_color_var, values=self.bg_colors, state="readonly")
+        bg_cb.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+        row += 1
+
+        # Choix couleur de fond TL
+        ttk.Label(frm, text="Fond TL :").grid(row=row, column=0, sticky="w", pady=4)
+        self.bg2_color_var = tk.StringVar(value=PARAMS.get("graph_background2_color", "mintcream"))
+        bg2_cb = ttk.Combobox(frm, textvariable=self.bg2_color_var, values=self.bg_colors, state="readonly")
+        bg2_cb.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+        row += 1
+
+        # Espacement avant le bouton
+        spacer = ttk.Frame(frm, height=5)
+        spacer.grid(row=row, column=0, pady=5)
+        row += 1
+
+        # Bouton de lancement - toujours visible au bas de la fenêtre
+        frm_button = ttk.Frame(self.root, padding=10)
+        frm_button.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+        
+        self.launch_btn = ttk.Button(frm_button, text="Lancer la mesure", command=self.on_launch, style="Launch.TButton")
+        self.launch_btn.pack(fill=tk.X, expand=True)
+
+        self.update_dynamic_fields()
+
+        # Configuration des colonnes pour qu'elles s'adaptent correctement
+        frm.columnconfigure(1, weight=1)
+        
+        # Support pour la molette de souris
+        self.root.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+        self.root.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        self.root.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+    def update_dynamic_fields(self, event=None):
+        # Efface les anciens champs dynamiques
+        for widget in self.dynamic_frame.winfo_children():
+            widget.destroy()
+        self.dynamic_fields.clear()
+
+        waveform = self.waveform_var.get()
+        row = 0
+
+        # Champs spécifiques selon le type de signal
+        if waveform in ("sine", "square"):
+            ttk.Label(self.dynamic_frame, text="Fréquence (Hz)").grid(row=row, column=0, sticky="w", pady=4)
+            var = tk.StringVar(value=str(PARAMS["generator_frequency"]))
+            entry = ttk.Entry(self.dynamic_frame, textvariable=var, width=15)
+            entry.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+            self.dynamic_fields["generator_frequency"] = var
+            row += 1
+
+        if waveform in ("linsweep", "logsweep"):
+            ttk.Label(self.dynamic_frame, text="Start freq (Hz)").grid(row=row, column=0, sticky="w", pady=4)
+            var1 = tk.StringVar(value=str(PARAMS["start_frequency"]))
+            entry1 = ttk.Entry(self.dynamic_frame, textvariable=var1, width=15)
+            entry1.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+            self.dynamic_fields["start_frequency"] = var1
+            row += 1
+
+            ttk.Label(self.dynamic_frame, text="Stop freq (Hz)").grid(row=row, column=0, sticky="w", pady=4)
+            var2 = tk.StringVar(value=str(PARAMS["stop_frequency"]))
+            entry2 = ttk.Entry(self.dynamic_frame, textvariable=var2, width=15)
+            entry2.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+            self.dynamic_fields["stop_frequency"] = var2
+            row += 1
+
+            if waveform == "linsweep":
+                ttk.Label(self.dynamic_frame, text="Vitesse (Hz/s)").grid(row=row, column=0, sticky="w", pady=4)
+                var3 = tk.StringVar(value=str(PARAMS["linsweep_hz_second"]))
+                entry3 = ttk.Entry(self.dynamic_frame, textvariable=var3, width=15)
+                entry3.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+                self.dynamic_fields["linsweep_hz_second"] = var3
+                row += 1
+            else:
+                ttk.Label(self.dynamic_frame, text="Vitesse (decades/s)").grid(row=row, column=0, sticky="w", pady=4)
+                var3 = tk.StringVar(value=str(PARAMS["logsweep_decades_sec"]))
+                entry3 = ttk.Entry(self.dynamic_frame, textvariable=var3, width=15)
+                entry3.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+                self.dynamic_fields["logsweep_decades_sec"] = var3
+                row += 1
+
+        if waveform == "random":
+            ttk.Label(self.dynamic_frame, text="Bande passante (Hz)").grid(row=row, column=0, sticky="w", pady=4)
+            var = tk.StringVar(value=str(PARAMS["bandwidth"]))
+            entry = ttk.Entry(self.dynamic_frame, textvariable=var, width=15)
+            entry.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+            self.dynamic_fields["bandwidth"] = var
+            row += 1
+
+            hp_var = tk.BooleanVar(value=PARAMS["hp_filter"])
+            chk = ttk.Checkbutton(self.dynamic_frame, text="Filtre passe-haut", variable=hp_var)
+            chk.grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+            self.dynamic_fields["hp_filter"] = hp_var
+            row += 1
+
+        if waveform == "p_random":
+            ttk.Label(self.dynamic_frame, text="FFT lines").grid(row=row, column=0, sticky="w", pady=4)
+            var1 = tk.StringVar(value=str(PARAMS["fftlines"]))
+            entry1 = ttk.Entry(self.dynamic_frame, textvariable=var1, width=15)
+            entry1.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+            self.dynamic_fields["fftlines"] = var1
+            row += 1
+
+            ttk.Label(self.dynamic_frame, text="Nb séquences").grid(row=row, column=0, sticky="w", pady=4)
+            var2 = tk.StringVar(value=str(PARAMS["nbseq"]))
+            entry2 = ttk.Entry(self.dynamic_frame, textvariable=var2, width=15)
+            entry2.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+            self.dynamic_fields["nbseq"] = var2
+            row += 1
+            
+        # Configuration des colonnes pour qu'elles s'adaptent correctement
+        self.dynamic_frame.columnconfigure(1, weight=1)
+
+    def on_launch(self):
+        # Met à jour PARAMS avec les valeurs de l'UI
+        PARAMS["waveform"] = self.waveform_var.get()
+        for key, var in self.param_widgets.items():
+            try:
+                PARAMS[key] = float(var.get()) if "." in var.get() or "e" in var.get().lower() else int(var.get())
+            except Exception:
+                PARAMS[key] = var.get()
+        for key, var in self.dynamic_fields.items():
+            if isinstance(var, tk.BooleanVar):
+                PARAMS[key] = var.get()
+            else:
+                try:
+                    PARAMS[key] = float(var.get()) if "." in var.get() or "e" in var.get().lower() else int(var.get())
+                except Exception:
+                    PARAMS[key] = var.get()
+        PARAMS["graph_background_color"] = self.bg_color_var.get()
+        PARAMS["graph_background2_color"] = self.bg2_color_var.get()
+        
+        # Animation du bouton
+        self.launch_btn.config(state="disabled")
+        self.launch_btn.config(text="Mesure en cours...")
+        
+        # Lancer la mesure dans un thread pour ne pas bloquer l'UI
+        threading.Thread(target=self.run_measurement_and_plot, daemon=True).start()
+
+    def run_measurement_and_plot(self):
+        try:
+            # Appel de la fonction d'acquisition
+            data_dict, interpretations, sample_rate = perform_measurement()
+            # Affichage des courbes dans le thread principal pour éviter les warnings/erreurs matplotlib
+            self.root.after(0, lambda: self.plot_results(data_dict, interpretations, sample_rate))
+        finally:
+            self.root.after(0, lambda: self.launch_btn.config(state="normal", text="Lancer la mesure"))
+
+    def plot_results(self, data_dict, interpretations, sample_rate):
+        nb = PARAMS["nb_channels"]
+        # Affichage FFT micros avec style moderne
+        if nb == 4:
+            fig, axs = plt.subplots(2, 2, figsize=(12, 8), facecolor='white', dpi=100)
+            axs = axs.flatten()
+        else:
+            fig, axs = plt.subplots(nb, 1, figsize=(12, 4 * nb), facecolor='white', dpi=100)
+            if nb == 1:
+                axs = [axs]
+                
+        # Style moderne pour matplotlib
+        plt.style.use('seaborn-v0_8-whitegrid')
+        
+        update_figure(fig, axs, data_dict, interpretations, sample_rate)
+
+        # Affichage TL dans une autre figure, sans attendre la fermeture de la première
+        if nb >= 4:
+            def show_tl():
+                freq_ref, s_dbspl_ref = compute_fft(data_dict[0], sample_rate, interpretations[0], 0)
+                spl_arrays = []
+                for ch in [1, 2, 3]:
+                    freq, s_dbspl = compute_fft(data_dict[ch], sample_rate, interpretations[ch], ch)
+                    spl_arrays.append(s_dbspl)
+                spl_mean_energy = calculate_energy_average_SPL(spl_arrays)
+                TL = spl_mean_energy - s_dbspl_ref
+                TL_smoothed = smooth_curve(TL, window_size=PARAMS["smooth_qty"])
+                
+                # Figure TL avec style moderne
+                fig_TL, ax_TL = plt.subplots(figsize=(12, 6), facecolor='white', dpi=100)
+                ax_TL.semilogx(freq_ref, TL_smoothed, color='#2980b9', lw=2.5, label="Transmission Loss (TL)")
+                ax_TL.set_facecolor(PARAMS["graph_background2_color"])
+                ax_TL.set_title("Transmission Loss (TL [dB])", fontsize=16, fontweight='bold')
+                ax_TL.set_xlabel("Fréquence [Hz]", fontsize=12, fontweight='bold')
+                ax_TL.set_ylabel("TL [dB]", fontsize=12, fontweight='bold')
+                
+                # Grille améliorée
+                ax_TL.grid(which='major', linestyle='-', alpha=0.7, color='#cccccc')
+                ax_TL.grid(which='minor', linestyle=':', alpha=0.4, color='#dddddd')
+                ax_TL.minorticks_on()
+                
+                # Fréquences d'octave
+                octave_freqs = [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000]
+                ax_TL.set_xticks(octave_freqs)
+                ax_TL.set_xticklabels([str(f) for f in octave_freqs], rotation=45, fontsize=10)
+                ax_TL.set_xlim(PARAMS["xlim"])
+                ax_TL.set_ylim([min(TL)-5, max(TL)+5])
+                
+                # Marquage du pic
+                if TL_smoothed.size:
+                    idx_max = np.argmax(TL_smoothed)
+                    peak_freq = freq_ref[idx_max]
+                    peak_TL = TL_smoothed[idx_max]
+                    ax_TL.plot(peak_freq, peak_TL, 'o', color='#e74c3c', markersize=10, 
+                              markeredgewidth=2, markeredgecolor='white')
+                    y_offset = 5 if peak_TL < PARAMS["ylim"][1] - 10 else -10
+                    ax_TL.annotate(f"Pic: {peak_TL:.1f} dB\n@ {peak_freq:.1f} Hz", 
+                                   xy=(peak_freq, peak_TL), 
+                                   xytext=(peak_freq, peak_TL + y_offset),
+                                   textcoords='data',
+                                   arrowprops=dict(facecolor='#e74c3c', shrink=0.05, width=2),
+                                   fontsize=11,
+                                   ha='center',
+                                   bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="#e74c3c", alpha=0.8))
+                
+                # Style de légende
+                ax_TL.legend(fontsize=12, framealpha=0.9, facecolor='white', edgecolor='#cccccc')
+                
+                plt.tight_layout()
+                fig_TL.show()
+                
+            # Lance l'affichage TL dans le thread principal aussi
+            self.root.after(0, show_tl)
+
+        plt.tight_layout()
+        fig.show()
+
+################################################################################
+# Lancement de l'interface
+################################################################################
+
+if __name__ == "__main__":
+
+    root = tk.Tk()
+    app = DynamicParamUI(root)
+    root.mainloop()
